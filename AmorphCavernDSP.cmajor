@@ -1,0 +1,162 @@
+/*
+    AMORPH CAVERN — audio-reactive SVG game (Amorph_FX).
+
+    This DSP is deliberately lean: it is a clean stereo pass-through that
+    (1) analyses the incoming audio into three bands and an overall level and
+        streams those to the UI as output events (~45 Hz), and
+    (2) accepts a "Danger" value back FROM the game UI and bends the audio with
+        it (a resonant-ish low-pass that closes + tanh drive that opens up the
+        more danger there is) so the player literally HEARS how close the
+        creature is to the cavern walls.
+
+    So the data flows both ways:
+        audio  -> bands/level  -> shapes the SVG world
+        game   -> danger param -> bends the audio
+
+    Verified dev-kit patterns used: graph + core processor, the 3-step parameter
+    pattern, processor.frequency/period for sample rate, float64 maths cast back
+    to float, unconditional out<- + advance() every loop iteration, host-rate
+    metering emitted via output events.
+*/
+
+processor AmorphCavernProc
+{
+    input  stream float<2> in;
+    output stream float<2> out;
+
+    input event float param1 [[ name: "Sensitivity", min: 0.0, max: 3.0, init: 1.0 ]];
+    input event float param2 [[ name: "Danger",      min: 0.0, max: 1.0, init: 0.0 ]];
+    input event float param3 [[ name: "FX Amount",   min: 0.0, max: 1.0, init: 0.6 ]];
+    input event float param4 [[ name: "Bypass",      min: 0.0, max: 1.0, init: 0.0, step: 1.0 ]];
+
+    // analysis -> UI
+    output event float levelOut;
+    output event float bassOut;
+    output event float midOut;
+    output event float trebleOut;
+
+    float p_sens   = 1.0f;
+    float p_danger = 0.0f;
+    float p_fx     = 0.6f;
+    float p_bypass = 0.0f;
+
+    event param1 (float v) { p_sens   = clamp (v, 0.0f, 3.0f); }
+    event param2 (float v) { p_danger = clamp (v, 0.0f, 1.0f); }
+    event param3 (float v) { p_fx     = clamp (v, 0.0f, 1.0f); }
+    event param4 (float v) { p_bypass = v; }
+
+    // band-split one-pole states (mono analysis)
+    float lpBass = 0.0f;     // low-pass -> bass band
+    float lpHi   = 0.0f;     // low-pass -> derive treble (signal - lpHi)
+    // envelope followers
+    float envLevel = 0.0f, envBass = 0.0f, envMid = 0.0f, envTreble = 0.0f;
+    // game-bend low-pass state (stereo)
+    float fxL = 0.0f, fxR = 0.0f;
+    int   counter = 0;
+
+    float onePole (float hz, float dt)
+    {
+        return clamp (hz * float (twoPi) * dt, 0.0f, 0.99f);
+    }
+
+    float saturate (float x, float amt)
+    {
+        let d = 1.0f + amt * 6.0f;
+        return float (tanh (float64 (x * d))) / float (tanh (float64 (d)));
+    }
+
+    void main()
+    {
+        loop
+        {
+            let sr = float (processor.frequency);
+            let dt = float (processor.period);
+
+            let dryL = in[0];
+            let dryR = in[1];
+            let mono = (dryL + dryR) * 0.5f;
+
+            // ---------- 3-band analysis ----------
+            lpBass += onePole (180.0f,  dt) * (mono - lpBass);
+            lpHi   += onePole (3200.0f, dt) * (mono - lpHi);
+
+            let bass   = lpBass;
+            let treble = mono - lpHi;        // high-pass
+            let mid    = lpHi - lpBass;      // band in between
+
+            let atk = 0.02f;
+            envLevel  += atk * (abs (mono)   - envLevel);
+            envBass   += atk * (abs (bass)   - envBass);
+            envMid    += atk * (abs (mid)    - envMid);
+            envTreble += atk * (abs (treble) - envTreble);
+
+            // ---------- game-driven bend (danger -> sound) ----------
+            // cutoff sweeps from ~18 kHz (safe) down to ~400 Hz (about to crash)
+            let cutHz = clamp (18000.0f - p_danger * 17600.0f, 300.0f, sr * 0.45f);
+            let aFx = onePole (cutHz, dt);
+            fxL += aFx * (dryL - fxL);
+            fxR += aFx * (dryR - fxR);
+
+            let bentL = saturate (fxL, p_danger);
+            let bentR = saturate (fxR, p_danger);
+
+            // mix scales with both the FX-amount control and the danger amount,
+            // so when the player is safe (danger ~ 0) the audio is untouched.
+            let m = p_fx * p_danger;
+            var outL = dryL + m * (bentL - dryL);
+            var outR = dryR + m * (bentR - dryR);
+
+            if (p_bypass >= 0.5f) { outL = dryL; outR = dryR; }
+
+            out <- float<2> (outL, outR);
+
+            // ---------- stream bands to the UI ~45 Hz ----------
+            counter += 1;
+            if (counter >= int (sr * 0.022f))
+            {
+                let g = p_sens * 4.0f;   // visual make-up gain
+                levelOut  <- clamp (envLevel  * g,        0.0f, 1.0f);
+                bassOut   <- clamp (envBass   * g,        0.0f, 1.0f);
+                midOut    <- clamp (envMid    * g * 1.6f, 0.0f, 1.0f);
+                trebleOut <- clamp (envTreble * g * 2.4f, 0.0f, 1.0f);
+                counter = 0;
+            }
+
+            advance();
+        }
+    }
+}
+
+graph AmorphCavern [[ main ]]
+{
+    input  stream float<2> in;
+    output stream float<2> out;
+
+    input event float param1 [[ name: "Sensitivity", min: 0.0, max: 3.0, init: 1.0 ]];
+    input event float param2 [[ name: "Danger",      min: 0.0, max: 1.0, init: 0.0 ]];
+    input event float param3 [[ name: "FX Amount",   min: 0.0, max: 1.0, init: 0.6 ]];
+    input event float param4 [[ name: "Bypass",      min: 0.0, max: 1.0, init: 0.0, step: 1.0 ]];
+
+    output event float levelOut;
+    output event float bassOut;
+    output event float midOut;
+    output event float trebleOut;
+
+    node proc = AmorphCavernProc;
+
+    connection
+    {
+        in -> proc.in;
+        proc.out -> out;
+
+        param1 -> proc.param1;
+        param2 -> proc.param2;
+        param3 -> proc.param3;
+        param4 -> proc.param4;
+
+        proc.levelOut  -> levelOut;
+        proc.bassOut   -> bassOut;
+        proc.midOut    -> midOut;
+        proc.trebleOut -> trebleOut;
+    }
+}

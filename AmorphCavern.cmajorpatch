@@ -1,0 +1,17 @@
+{
+  "CmajorVersion": 1,
+  "ID": "com.amorph.crazysvg.cavern",
+  "version": "0.1.0",
+  "name": "Amorph Cavern",
+  "description": "Audio-reactive SVG game (proof of concept) — fly a morphing creature through a cavern carved live from your audio.",
+  "category": "effect",
+  "manufacturer": "Amorph",
+  "isInstrument": false,
+  "source": "AmorphCavernDSP.cmajor",
+  "view": {
+    "src": "AmorphCavernUI.js",
+    "width": 1000,
+    "height": 600,
+    "resizable": true
+  }
+}
